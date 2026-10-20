@@ -24,3 +24,5 @@ export {
   type NonceCheck,
   type PaymentClaimStore,
 } from "./claims";
+
+export { caip2Network, claimNetwork, v2Requirements, v2Resource, validateV2 } from "./v2";

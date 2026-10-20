@@ -15,7 +15,7 @@ x402 payment middleware and facilitator client — gate any HTTP route behind a 
 
 - Framework adapters for Next.js App Router and Express/Connect, plus a framework-agnostic core.
 - Verification and on-chain settlement are delegated to a facilitator — the hosted Furlpay facilitator by default, or point at your own.
-- USDC on Base and Solana resolved automatically; any SPL/ERC-20 asset via config.
+- Native Circle USDC on Base and Arbitrum, plus Solana USDC, resolved automatically; other assets via explicit config.
 
 ### What settles, and what merely quotes
 
@@ -40,18 +40,64 @@ settle SVM. If you are using the hosted default, use an EVM network.
 
 ## Why x402
 
-AI agents, scripts, and API clients cannot fill out card checkout forms. x402 lets a server answer `402 Payment Required` with machine-readable payment requirements; the client signs a stablecoin authorization and retries with an `X-PAYMENT` header; the server verifies, settles on-chain, and serves the request. No accounts, no API keys, no subscriptions — pay per call.
+AI agents, scripts, and API clients cannot fill out card checkout forms. x402 lets a server answer HTTP 402 with machine-readable payment requirements; the client signs an authorization and retries with a version-appropriate payment header. This middleware verifies local fields before asking the configured facilitator to settle, then serves only after a successful settlement verdict. No account or subscription is required by the protocol.
 
-### Protocol version: x402 V1
+### Protocol versions: V1 and V2 (issue #17)
 
-This package speaks **x402 V1**: the payment arrives in the `X-PAYMENT` request
-header, the receipt goes back in `X-PAYMENT-RESPONSE`, payloads carry
-`x402Version: 1`, and networks are plain names (`"base"`, `"solana"`).
+**On an unpinned Base or Arbitrum route**, the same middleware:
+- Preserves the existing **V1 JSON body**, accepting `X-PAYMENT` and returning `X-PAYMENT-RESPONSE`, with legacy plain network names.
+- Also includes a base64-encoded **V2 `PAYMENT-REQUIRED`** HTTP header. It contains a separate `resource` descriptor and an `accepts` offer with `amount`, not V1 `maxAmountRequired`; networks use CAIP-2 IDs (`eip155:8453` and `eip155:42161`).
+- Accepts V2 `PAYMENT-SIGNATURE` and returns `PAYMENT-RESPONSE` on success, while refusing simultaneous/conflicting payment headers.
+- Claims the EIP-3009 nonce **once across both wire versions**, preserving previous V1 claim-store keys on upgrades. An injected cross-instance claim store remains required for multi-worker deployments.
 
-x402 V2 (announced June 2026) moves to `PAYMENT-REQUIRED`, `PAYMENT-SIGNATURE`
-and `PAYMENT-RESPONSE` headers and CAIP-2 network identifiers. **V2 is not
-supported yet.** A client that sends only `PAYMENT-SIGNATURE` receives another
-`402`. The reference x402 SDKs remain V1-compatible, so V1 clients work.
+To **pin a route to one version**, set `x402Version: 1` (legacy) or `x402Version: 2` (V2-only) in the usual `withX402` / `expressX402` config:
+
+```ts
+export const GET = withX402(
+  async () => Response.json({ ok: true }),
+  {
+    payTo: "0xYOUR_RECOVERABLE_ADDRESS",
+    network: "arbitrum",
+    amount: "5000", // 0.005 native Circle USDC (six decimals)
+    x402Version: 2,
+    requireSettlement: "finalized",
+  }
+);
+```
+
+Arbitrum's default asset is native Circle USDC
+`0xaf88d065e77c8cC2239327C5EDb3A432268e5831`, **not bridged USDC.e**.
+Unknown EVM networks require an explicit `asset`, not a Base USDC fallback.
+V2 presently refuses network identifiers it cannot translate for Base or Arbitrum.
+
+**Express V2 resource binding:** Express usually exposes only a relative
+`req.originalUrl`. To issue a valid V2 challenge, configure `resourceUrl` to
+the specific trusted absolute endpoint URL; this SDK intentionally **does
+not** derive the paid resource origin from the incoming HTTP `Host` header.
+Unpinned Express routes with a relative URL keep the legacy V1 quote but
+decline V2 until configured. No source data is uploaded by this policy.
+
+```ts
+app.get("/premium",
+  expressX402({
+    payTo: "0xYOUR_RECOVERABLE_ADDRESS",
+    network: "arbitrum",
+    amount: "5000",
+    resourceUrl: "https://merchant.example.com/premium",
+    requireSettlement: "finalized",
+  }),
+  handler
+);
+```
+
+**Settlement caution:** local regression tests use only synthetic fixture payloads
+and injected fake facilitators. They prove refusal/replay/wire-format logic,
+**not** real EIP-712 signature verification, successful facilitator interoperability,
+a mainnet payment or a real buyer. The public FurlPay facilitator advertises
+V2 support for Arbitrum/Base, but its public discovery lists plain network names
+while the V2 wire specification requires CAIP-2. Confirm end-to-end settlement,
+correct chain/token, finality and a safely recoverable owner payee **before
+collecting live funds**. Mock `success: true` is not revenue.
 
 ## Installation
 
@@ -118,7 +164,9 @@ if (!result.paid) {
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `payTo` | `string` | — | Receiving address on the target network. Required. |
-| `network` | `"base" \| "solana"` | `"base"` | Settlement network. |
+| `network` | `"base"` \| `"arbitrum"` \| `"solana"` | `"base"` | Settlement network. V2 uses CAIP-2 on Base/Arbitrum and declines unknown V2 networks. |
+| `x402Version` | `1` \| `2` (optional) | Both | Default preserves V1 body and adds V2 header for known EVM networks; an explicit version pins the route. |
+| `resourceUrl` | `string` (optional) | request URL | Canonical absolute HTTP(S) URL for Express V2; do not infer from untrusted Host. |
 | `asset` | `string` | USDC on the chosen network | Token contract / mint address. |
 | `amount` | `string` | — | Price in atomic units of `asset` (USDC: 6 decimals). Required. |
 | `description` | `string` | `"x402 payment"` | Human-readable description in the 402 challenge. |

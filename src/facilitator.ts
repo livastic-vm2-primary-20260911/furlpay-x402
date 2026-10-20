@@ -1,6 +1,8 @@
 import type {
   PaymentPayload,
   PaymentRequirements,
+  AnyPaymentPayload,
+  AnyPaymentRequirements,
   SettleResponse,
   SettlementEvidence,
   SettlementStrength,
@@ -25,8 +27,8 @@ export const DEFAULT_FACILITATOR = "https://furlpay.com/api/x402/facilitator";
 
 export interface Facilitator {
   supported(): Promise<{ kinds: SupportedKind[] }>;
-  verify(paymentPayload: PaymentPayload, paymentRequirements: PaymentRequirements): Promise<VerifyResponse>;
-  settle(paymentPayload: PaymentPayload, paymentRequirements: PaymentRequirements): Promise<SettleResponse>;
+  verify(paymentPayload: AnyPaymentPayload, paymentRequirements: AnyPaymentRequirements): Promise<VerifyResponse>;
+  settle(paymentPayload: AnyPaymentPayload, paymentRequirements: AnyPaymentRequirements): Promise<SettleResponse>;
 }
 
 /**

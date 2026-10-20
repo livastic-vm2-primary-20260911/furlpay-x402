@@ -32,6 +32,31 @@ export interface PaymentRequirements {
   extra?: Record<string, unknown>;
 }
 
+/**
+ * x402 V2 moves the amount into each accepted offer and resource metadata
+ * into the enclosing PaymentRequired envelope. Network names are CAIP-2.
+ */
+export interface PaymentRequirementsV2 {
+  scheme: "exact" | (string & {});
+  network: Network;
+  amount: string;
+  asset: string;
+  payTo: string;
+  maxTimeoutSeconds: number;
+  extra?: Record<string, unknown>;
+}
+
+export interface PaymentPayloadV2 {
+  x402Version: 2;
+  resource?: { url: string; description?: string; mimeType?: string };
+  accepted: PaymentRequirementsV2;
+  payload: PaymentPayload["payload"];
+  extensions?: Record<string, unknown>;
+}
+
+export type AnyPaymentPayload = PaymentPayload | PaymentPayloadV2;
+export type AnyPaymentRequirements = PaymentRequirements | PaymentRequirementsV2;
+
 export interface VerifyResponse {
   isValid: boolean;
   payer?: string;

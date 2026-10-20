@@ -178,7 +178,7 @@ test("withX402 marks the PAID response uncacheable", async () => {
 
   assert.strictEqual(res.status, 200);
   assert.strictEqual(res.headers.get("cache-control"), "no-store, private");
-  assert.strictEqual(res.headers.get("vary"), "X-PAYMENT");
+  assert.strictEqual(res.headers.get("vary"), "X-PAYMENT, PAYMENT-SIGNATURE");
 });
 
 test("withX402 overrides a handler that set its own cache policy", async () => {
@@ -231,5 +231,5 @@ test("expressX402 sets the headers on both the challenge and the paid path", asy
   );
   assert.strictEqual(nexted, true);
   assert.strictEqual(res2.headers["Cache-Control"], "no-store, private");
-  assert.strictEqual(res2.headers["Vary"], "X-PAYMENT");
+  assert.strictEqual(res2.headers["Vary"], "X-PAYMENT, PAYMENT-SIGNATURE");
 });

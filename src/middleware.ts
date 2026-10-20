@@ -2,10 +2,13 @@ import { DEFAULT_FACILITATOR, useFacilitator, type Facilitator } from "./facilit
 import { verifyLocally } from "./verify";
 import { issueQuote, verifyQuote } from "./binding";
 import { MemoryClaimStore, canonicalNonce, claimKey, type PaymentClaimStore } from "./claims";
+import { caip2Network, claimNetwork, v2Requirements, v2Resource, validateV2 } from "./v2";
 import type {
   Network,
+  AnyPaymentPayload,
   PaymentPayload,
   PaymentRequirements,
+  PaymentRequirementsV2,
   SettlementEvidence,
   SettlementStrength,
 } from "./types";
@@ -18,6 +21,20 @@ const X402_VERSION = 1;
 
 export interface PriceConfig {
   payTo: string;
+  /**
+   * Canonical absolute URL when mounting Express (which usually exposes a
+   * relative req.originalUrl). Required for Express V2 offers; NEVER infer a
+   * settlement resource from an untrusted HTTP Host header.
+   */
+  resourceUrl?: string;
+  /**
+   * Omitted: keep the V1 JSON challenge for old payers AND advertise a V2
+   * PAYMENT-REQUIRED header when this network supports it. Both wire headers
+   * can pay this route and share the same nonce claim store.
+   *
+   * Explicit 1 or 2 pins the route to one protocol for strict deployments.
+   */
+  x402Version?: 1 | 2;
   network?: Network;
   asset?: string;
   /** Price in atomic units of `asset` (USDC = 6 decimals). e.g. "10000" = $0.01. */
@@ -110,16 +127,23 @@ function resolveClaimStore(cfg: PriceConfig): PaymentClaimStore {
  */
 export const NO_STORE_HEADERS: Readonly<Record<string, string>> = Object.freeze({
   "Cache-Control": "no-store, private",
-  Vary: "X-PAYMENT",
+  Vary: "X-PAYMENT, PAYMENT-SIGNATURE",
 });
 
-const USDC = {
+const USDC: Readonly<Record<string, string>> = Object.freeze({
   base: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "eip155:8453": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  arbitrum: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+  "eip155:42161": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
   solana: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-} as const;
+});
 
 export function buildRequirements(resource: string, cfg: PriceConfig): PaymentRequirements {
   const network = cfg.network ?? "base";
+  const asset = cfg.asset ?? USDC[network];
+  // Falling back to BASE USDC on Arbitrum or an unknown chain would advertise
+  // the wrong payment token. A seller needs an explicit asset on unknown chains.
+  if (!asset) throw new Error("asset must be configured for network " + network);
   return {
     scheme: "exact",
     network,
@@ -129,7 +153,7 @@ export function buildRequirements(resource: string, cfg: PriceConfig): PaymentRe
     mimeType: "application/json",
     payTo: cfg.payTo,
     maxTimeoutSeconds: cfg.maxTimeoutSeconds ?? 300,
-    asset: cfg.asset ?? USDC[network as "base" | "solana"] ?? USDC.base,
+    asset,
   };
 }
 
@@ -190,22 +214,56 @@ function paymentIdentity(network: string, payload: PaymentPayload): PaymentIdent
 }
 
 export type GateResult =
-  | { paid: false; status: 402; body: { x402Version: number; error: string; accepts: PaymentRequirements[] } }
+  | {
+      paid: false;
+      status: 402;
+      body: {
+        x402Version: number;
+        error: string;
+        accepts: Array<PaymentRequirements | PaymentRequirementsV2>;
+        resource?: ReturnType<typeof v2Resource>;
+        extensions?: Record<string, unknown>;
+      };
+    }
   | { paid: false; status: 400; body: { error: string } }
   | { paid: true; payer: string; transaction: string; settlementHeader: string; settlement?: SettlementEvidence };
 
 /**
- * Core gate: given the resource URL and the incoming X-PAYMENT header, returns
- * either a 402 challenge or a paid result with the settlement receipt.
+ * Framework-neutral gate. Default V1 remains unchanged.
+ * Opt-in V2 uses the standard accepted+payload object and CAIP-2 wire shape.
+ * The configured facilitator handles actual cryptographic verification and
+ * settlement. A local check is NOT proof of a real signature or transaction.
  */
-export async function gate(resource: string, xPaymentHeader: string | null, cfg: PriceConfig): Promise<GateResult> {
-  const requirements = buildRequirements(resource, cfg);
+export async function gate(
+  resource: string,
+  paymentHeader: string | null,
+  cfg: PriceConfig
+): Promise<GateResult> {
+  // A direct gate() caller has no HTTP header name to inspect. With no
+  // configured version, infer V2 only from an actual V2 payment payload;
+  // the existing no-payment/default challenge remains V1. Framework wrappers
+  // pin their mode from the header name and never trust this inference.
+  let inferredVersion: 1 | 2 = 1;
+  if (cfg.x402Version === undefined && paymentHeader && paymentHeader.length <= 16384) {
+    try {
+      const preflight = JSON.parse(Buffer.from(paymentHeader, "base64").toString("utf8"));
+      if (preflight?.x402Version === 2) inferredVersion = 2;
+    } catch (_) {}
+  }
+  const version = cfg.x402Version ?? inferredVersion;
+  if (version !== 1 && version !== 2) {
+    throw new Error("Unsupported x402 protocol version");
+  }
+  const original = buildRequirements(resource, cfg);
+  const requirements = version === 2
+    ? { ...original, network: caip2Network(String(original.network)) }
+    : original;
+  // Enforce canonical merchant resource URL EVEN if a caller presents a
+  // pre-signed V2 payload directly without first requesting a 402 challenge.
+  if (version === 2) v2Resource(requirements);
 
-  if (!xPaymentHeader) {
-    // The challenge carries a fresh quote when binding is on. Minted per
-    // challenge rather than per route so two payers never share one, which is
-    // what makes the single-use claim below meaningful.
-    const challenge = cfg.bindingSecret
+  function challenge(error: string, issueFreshQuote = false): GateResult {
+    const accepted = issueFreshQuote && cfg.bindingSecret
       ? {
           ...requirements,
           extra: {
@@ -214,163 +272,118 @@ export async function gate(resource: string, xPaymentHeader: string | null, cfg:
           },
         }
       : requirements;
+    if (version === 2) {
+      return {
+        paid: false,
+        status: 402,
+        body: {
+          x402Version: 2,
+          error,
+          resource: v2Resource(requirements),
+          accepts: [v2Requirements(accepted)],
+          extensions: {},
+        },
+      };
+    }
     return {
       paid: false,
       status: 402,
-      body: { x402Version: X402_VERSION, error: "X-PAYMENT required", accepts: [challenge] },
+      body: { x402Version: 1, error, accepts: [accepted] },
     };
   }
 
-  let payload: PaymentPayload;
+  if (!paymentHeader) {
+    return challenge(version === 2 ? "PAYMENT-SIGNATURE required" : "X-PAYMENT required", true);
+  }
+  if (paymentHeader.length > 16384) {
+    return { paid: false, status: 400, body: { error: "payment header exceeds 16KiB" } };
+  }
+
+  let payload: AnyPaymentPayload;
   try {
-    payload = JSON.parse(Buffer.from(xPaymentHeader, "base64").toString("utf8"));
+    payload = JSON.parse(Buffer.from(paymentHeader, "base64").toString("utf8"));
   } catch {
-    return { paid: false, status: 400, body: { error: "X-PAYMENT is not valid base64 JSON" } };
+    return {
+      paid: false,
+      status: 400,
+      body: { error: version === 2 ? "PAYMENT-SIGNATURE is not valid base64 JSON" : "X-PAYMENT is not valid base64 JSON" },
+    };
   }
 
-  // LOCAL CHECKS BEFORE THE FACILITATOR SEES IT.
-  //
-  // `cfg.facilitator` is a documented option, so "the hosted one" and "any third
-  // party" are the same code path — and delegating the whole decision made that
-  // party the entire security boundary. These checks cost nothing and hold even
-  // when the facilitator is wrong, misconfigured or hostile.
-  //
-  // Running them first also means a payment that does not match what we asked
-  // for is never submitted for settlement at all. Settling first and refusing
-  // afterwards would move money on-chain for a resource we then decline to
-  // release, which is a worse failure than a 402.
+  let checkedPayload: PaymentPayload;
+  let echoedQuote: unknown;
+  if (version === 2) {
+    // Validate the V2 accepted envelope BEFORE any facilitator receives funds.
+    // This also refuses mismatched versions on the same route.
+    const v2 = validateV2(payload, requirements);
+    if (!v2.ok) return challenge(v2.reason);
+    checkedPayload = v2.normalized; // reuse V1 EIP-3009 auth checks without trusting new fields
+    echoedQuote = v2.quote;
+  } else {
+    checkedPayload = payload as PaymentPayload;
+    echoedQuote = checkedPayload?.extra?.quote;
+  }
+
   if (!cfg.skipLocalVerification) {
-    const local = verifyLocally(payload, requirements);
+    const local = verifyLocally(checkedPayload, requirements);
     if (!local.ok) {
-      return {
-        paid: false,
-        status: 402,
-        body: {
-          x402Version: X402_VERSION,
-          error: `${local.reason}: ${local.detail ?? ""}`.trim(),
-          accepts: [requirements],
-        },
-      };
+      return challenge((local.reason ?? "invalid_payment") + ": " + (local.detail ?? ""));
     }
   }
 
-  // RESOURCE BINDING. Field checks cannot catch cross-resource substitution,
-  // because every field of a payment for another resource at the same price
-  // genuinely matches. The quote is the only thing that names the resource.
   if (cfg.bindingSecret) {
-    const q = verifyQuote(payload.extra?.quote, requirements, cfg.bindingSecret);
-    if (!q.ok) {
-      return {
-        paid: false,
-        status: 402,
-        body: {
-          x402Version: X402_VERSION,
-          error: `${q.reason}: ${q.detail ?? ""}`.trim(),
-          accepts: [requirements],
-        },
-      };
+    const quote = verifyQuote(echoedQuote, requirements, cfg.bindingSecret);
+    if (!quote.ok) {
+      return challenge((quote.reason ?? "invalid_quote") + ": " + (quote.detail ?? ""));
     }
   }
 
-  // SINGLE USE. Claimed before settlement so two concurrent copies of one
-  // payment cannot both reach the settler, and claimed on the on-chain nonce
-  // whether or not binding is on (see claimKey). The quote is a restriction
-  // checked above, never the replay identity.
+  // IMPORTANT: V2 CAIP-2 network ids map to the existing deployed V1
+  // claim-store namespace, so a rolling upgrade cannot reclaim an earlier
+  // on-chain EIP-3009 authorization under a different key.
   const singleUse = cfg.singleUse !== false;
   const store = singleUse ? resolveClaimStore(cfg) : null;
   let key = "";
   if (store) {
-    const identity = paymentIdentity(String(requirements.network), payload);
-    if (!identity.ok) {
-      return {
-        paid: false,
-        status: 402,
-        body: {
-          x402Version: X402_VERSION,
-          error: `malformed_payload: ${identity.detail}`,
-          accepts: [requirements],
-        },
-      };
-    }
-    key = claimKey(String(requirements.network), identity.nonce);
+    const identity = paymentIdentity(String(requirements.network), checkedPayload);
+    if (!identity.ok) return challenge("malformed_payload: " + identity.detail);
+    key = claimKey(claimNetwork(String(requirements.network)), identity.nonce);
     const won = await store.claim(key, identity.holdUntilMs);
     if (!won) {
-      return {
-        paid: false,
-        status: 402,
-        body: {
-          x402Version: X402_VERSION,
-          error: "payment_already_used: this authorization has already released the resource",
-          accepts: [requirements],
-        },
-      };
+      return challenge("payment_already_used: this authorization has already released the resource");
     }
   }
 
   const facilitator = resolveFacilitator(cfg.facilitator);
   let settlement: Awaited<ReturnType<Facilitator["settle"]>>;
   try {
-    settlement = await facilitator.settle(payload, requirements);
+    settlement = await facilitator.settle(
+      payload,
+      version === 2 ? v2Requirements(requirements) : requirements
+    );
   } catch (err) {
-    // UNKNOWN, NOT FAILED. The settler may well have landed the transaction and
-    // failed on the way back, so the claim is NOT released — releasing here
-    // re-opens replay for the payment most likely to have actually settled.
-    return {
-      paid: false,
-      status: 402,
-      body: {
-        x402Version: X402_VERSION,
-        error: `settlement_unknown: ${(err as Error).message}`,
-        accepts: [requirements],
-      },
-    };
+    // UNKNOWN, not a definite failure. Keep nonce claimed so that an
+    // indeterminate settlement cannot release goods twice.
+    return challenge("settlement_unknown: " + (err instanceof Error ? err.name : "Error"));
   }
 
   if (!settlement.success) {
-    // A definite no: no money moved, so the payer keeps their authorization and
-    // can retry after fixing whatever the facilitator objected to. Holding the
-    // claim here would lock someone out of their own unspent payment.
     if (store) await store.release(key);
-    return {
-      paid: false,
-      status: 402,
-      body: { x402Version: X402_VERSION, error: settlement.errorReason ?? "payment_failed", accepts: [requirements] },
-    };
+    return challenge(settlement.errorReason ?? "payment_failed");
   }
-
-  // The requirement is checked AFTER settlement succeeded and BEFORE anything is
-  // released. A settlement that landed but is not yet strong enough is not an
-  // error — it is a 402 the payer can clear by waiting, so the challenge is
-  // returned rather than a failure.
   if (cfg.requireSettlement && !meetsStrength(settlement.settlement, cfg.requireSettlement)) {
-    // RELEASED, because this 402 is an invitation to retry the SAME payment
-    // once it is deeper. Holding the claim would make "wait and try again" the
-    // one thing the payer cannot do. Releasing is safe here precisely because
-    // nothing was released to them: a concurrent duplicate re-claiming only
-    // reaches this same check and is refused the same way.
+    // Only a paid response that passed the configured finality gate grants
+    // the resource; this 402 refuses access without pretending it's settled.
     if (store) await store.release(key);
-    return {
-      paid: false,
-      status: 402,
-      body: {
-        x402Version: X402_VERSION,
-        error: `settlement_strength_insufficient: required ${cfg.requireSettlement}, observed ${
-          settlement.settlement?.strength ?? "unknown"
-        }`,
-        accepts: [requirements],
-      },
-    };
+    return challenge("settlement_strength_insufficient: required " +
+      cfg.requireSettlement + ", observed " + (settlement.settlement?.strength ?? "unknown"));
   }
 
-  const settlementHeader = Buffer.from(JSON.stringify(settlement)).toString("base64");
-  // `transaction` is guaranteed non-empty by the facilitator client, which
-  // refuses a success that does not name one. The non-null assertions that used
-  // to sit here were asserting over unvalidated remote data.
   return {
     paid: true,
     payer: settlement.payer ?? "",
     transaction: settlement.transaction ?? "",
-    settlementHeader,
+    settlementHeader: Buffer.from(JSON.stringify(settlement)).toString("base64"),
     settlement: settlement.settlement,
   };
 }
@@ -384,20 +397,59 @@ export async function gate(resource: string, xPaymentHeader: string | null, cfg:
  *     { payTo: "0x...", network: "base", amount: "10000", description: "Premium data" },
  *   );
  */
+/**
+ * Default V1 routes also emit an optional V2 challenge header.
+ * Never advertise a V2 network we cannot map (e.g. Solana without EVM).
+ */
+async function v2HeaderFor(
+  resource: string,
+  cfg: PriceConfig,
+  result: GateResult
+): Promise<string | undefined> {
+  if (result.paid || result.status !== 402 || cfg.x402Version === 1) return undefined;
+  if (cfg.x402Version === 2) {
+    return Buffer.from(JSON.stringify(result.body)).toString("base64");
+  }
+  try {
+    const v2 = await gate(resource, null, { ...cfg, x402Version: 2 });
+    if (!v2.paid && v2.status === 402) {
+      return Buffer.from(JSON.stringify(v2.body)).toString("base64");
+    }
+  } catch (_) {
+    // Existing V1 unsupported-by-V2 networks keep their old V1 challenge.
+  }
+  return undefined;
+}
+
 export function withX402(
   handler: (req: Request) => Promise<Response> | Response,
   cfg: PriceConfig
 ): (req: Request) => Promise<Response> {
   return async (req: Request) => {
-    const result = await gate(req.url, req.headers.get("x-payment"), cfg);
+    const legacy = req.headers.get("x-payment");
+    const modern = req.headers.get("payment-signature");
+    const mode = cfg.x402Version ?? (modern ? 2 : 1);
+    if ((legacy && modern) || (cfg.x402Version === 2 && legacy) ||
+        (cfg.x402Version === 1 && modern)) {
+      return Response.json({ error: "conflicting_or_wrong_payment_header" }, {
+        status: 400, headers: NO_STORE_HEADERS,
+      });
+    }
+    // Reuse ONE original config claim store across both version modes.
+    const effective: PriceConfig = cfg.x402Version === undefined
+      ? { ...cfg, x402Version: mode, claimStore: resolveClaimStore(cfg) }
+      : cfg;
+    const result = await gate(req.url, mode === 2 ? modern : legacy, effective);
     if (!result.paid) {
-      return Response.json(result.body, { status: result.status, headers: NO_STORE_HEADERS });
+      const headers: Record<string, string> = { ...NO_STORE_HEADERS };
+      const modernChallenge = await v2HeaderFor(req.url, cfg, result);
+      if (modernChallenge && result.status === 402) {
+        headers["PAYMENT-REQUIRED"] = modernChallenge;
+      }
+      return Response.json(result.body, { status: result.status, headers });
     }
     const res = await handler(req);
-    res.headers.set("X-PAYMENT-RESPONSE", result.settlementHeader);
-    // Set, not appended: a handler that already chose a caching policy chose it
-    // without knowing the response was paid for, and a cacheable paid response
-    // is served to the next unpaid caller.
+    res.headers.set(mode === 2 ? "PAYMENT-RESPONSE" : "X-PAYMENT-RESPONSE", result.settlementHeader);
     for (const [k, v] of Object.entries(NO_STORE_HEADERS)) res.headers.set(k, v);
     return res;
   };
@@ -415,17 +467,33 @@ interface ResLike { status(code: number): ResLike; json(body: unknown): void; se
  */
 export function expressX402(cfg: PriceConfig) {
   return async (req: ReqLike, res: ResLike, next: () => void) => {
-    const header = req.headers["x-payment"];
-    const xPayment = Array.isArray(header) ? header[0] : header ?? null;
-    const result = await gate(req.originalUrl ?? req.url, xPayment, cfg);
-    // Stamped before the branch: the challenge must be uncacheable too, and
-    // setting it in both arms separately is how one of them drifts.
+    const legacy = req.headers["x-payment"];
+    const modern = req.headers["payment-signature"];
+    const mode = cfg.x402Version ?? (modern ? 2 : 1);
     for (const [k, v] of Object.entries(NO_STORE_HEADERS)) res.setHeader(k, v);
+    const malformed = (Array.isArray(legacy) && legacy.length !== 1) ||
+      (Array.isArray(modern) && modern.length !== 1);
+    if (malformed || (legacy && modern) || (cfg.x402Version === 2 && legacy) ||
+        (cfg.x402Version === 1 && modern)) {
+      res.status(400).json({ error: "conflicting_or_wrong_payment_header" });
+      return;
+    }
+    const effective: PriceConfig = cfg.x402Version === undefined
+      ? { ...cfg, x402Version: mode, claimStore: resolveClaimStore(cfg) }
+      : cfg;
+    const header = mode === 2 ? modern : legacy;
+    const payment = Array.isArray(header) ? header[0] : header ?? null;
+    const resource = cfg.resourceUrl ?? req.originalUrl ?? req.url;
+    const result = await gate(resource, payment, effective);
     if (!result.paid) {
+      const modernChallenge = await v2HeaderFor(resource, cfg, result);
+      if (modernChallenge && result.status === 402) {
+        res.setHeader("PAYMENT-REQUIRED", modernChallenge);
+      }
       res.status(result.status).json(result.body);
       return;
     }
-    res.setHeader("X-PAYMENT-RESPONSE", result.settlementHeader);
+    res.setHeader(mode === 2 ? "PAYMENT-RESPONSE" : "X-PAYMENT-RESPONSE", result.settlementHeader);
     next();
   };
 }
