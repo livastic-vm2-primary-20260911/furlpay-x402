@@ -37,6 +37,19 @@ export function claimNetwork(network: string): string {
   return network;
 }
 
+/**
+ * Claim BOTH historical network spellings on the same EIP-3009 chain.
+ * Prior V1 configurations could name either plain "base"/"arbitrum" or the
+ * CAIP-2 identifier; omitting one reopens an old spent authorization.
+ * Unknown networks and Solana retain their original single scope.
+ */
+export function claimNetworks(network: string): string[] {
+  const canonical = claimNetwork(network);
+  if (canonical === "base") return ["base", "eip155:8453"];
+  if (canonical === "arbitrum") return ["arbitrum", "eip155:42161"];
+  return [canonical];
+}
+
 export function v2Requirements(legacy: PaymentRequirements): PaymentRequirementsV2 {
   const network = caip2Network(String(legacy.network));
   return {

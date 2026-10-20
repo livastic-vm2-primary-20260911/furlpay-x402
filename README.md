@@ -48,7 +48,7 @@ AI agents, scripts, and API clients cannot fill out card checkout forms. x402 le
 - Preserves the existing **V1 JSON body**, accepting `X-PAYMENT` and returning `X-PAYMENT-RESPONSE`, with legacy plain network names.
 - Also includes a base64-encoded **V2 `PAYMENT-REQUIRED`** HTTP header. It contains a separate `resource` descriptor and an `accepts` offer with `amount`, not V1 `maxAmountRequired`; networks use CAIP-2 IDs (`eip155:8453` and `eip155:42161`).
 - Accepts V2 `PAYMENT-SIGNATURE` and returns `PAYMENT-RESPONSE` on success, while refusing simultaneous/conflicting payment headers.
-- Claims the EIP-3009 nonce **once across both wire versions**, preserving previous V1 claim-store keys on upgrades. An injected cross-instance claim store remains required for multi-worker deployments.
+- Claims the EIP-3009 nonce **once across both wire versions**, reserving the old V1 plain and CAIP-2 namespace aliases on upgrades. A single payment therefore occupies **two** alias keys on a known EVM chain; failure rolls back only keys acquired by that attempt, indeterminate outcomes retain both. An injected cross-instance claim store remains required for multi-worker deployments.
 
 To **pin a route to one version**, set `x402Version: 1` (legacy) or `x402Version: 2` (V2-only) in the usual `withX402` / `expressX402` config:
 

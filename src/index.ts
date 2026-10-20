@@ -25,4 +25,4 @@ export {
   type PaymentClaimStore,
 } from "./claims";
 
-export { caip2Network, claimNetwork, v2Requirements, v2Resource, validateV2 } from "./v2";
+export { caip2Network, claimNetwork, claimNetworks, v2Requirements, v2Resource, validateV2 } from "./v2";

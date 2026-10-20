@@ -3,7 +3,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  gate, withX402, expressX402, buildRequirements, MemoryClaimStore, claimKey, claimNetwork,
+  gate, withX402, expressX402, buildRequirements, MemoryClaimStore,
+  claimKey, claimNetwork, claimNetworks,
 } = require("../dist/index.js");
 
 const TO = "0x1111111111111111111111111111111111111111";
@@ -507,4 +508,63 @@ test("V2 cannot bypass absolute resource gate with a forged direct paid header",
  delete payload.resource; // Resource is OPTIONAL in x402 V2, so must fail safely.
  await assert.rejects(gate("/relative.csv",hdr(payload),cfg),/absolute HTTP/);
  assert.equal(f.calls.length,0);
+});
+
+
+test("both old V1 network alias names block a new V2 claim after rolling upgrade",async()=>{
+ for(const oldNetwork of ["base","eip155:8453","arbitrum","eip155:42161"]){
+  const isBase=oldNetwork==="base"||oldNetwork==="eip155:8453";
+  const network=isBase?"base":"arbitrum";
+  const store=new MemoryClaimStore();
+  assert.equal(store.claim(claimKey(oldNetwork,NONCE)),true);
+  const f=stub(),cfg={...cfgV2,network,facilitator:f,claimStore:store};
+  const offer=await offerFor(cfg);
+  // Match target chain only; no user wallet or network calls.
+  const out=await gate(URL,hdr(v2Payment(offer)),cfg);
+  assert.equal(out.paid,false,oldNetwork);
+  assert.match(out.body.error,/payment_already_used/);
+  assert.equal(f.calls.length,0);
+  // Keys tentatively claimed by the failed new attempt must be released.
+  // Never release the OLD known-spent authorization.
+  assert.equal(store.size,1,"old claimed alias must survive");
+  assert.equal(store.claim(claimKey(oldNetwork,NONCE)),false);
+ }
+});
+
+test("V2 reserves both old V1 alias keys for one real authorization",async()=>{
+ assert.deepEqual(claimNetworks("base"),["base","eip155:8453"]);
+ assert.deepEqual(claimNetworks("eip155:8453"),["base","eip155:8453"]);
+ assert.deepEqual(claimNetworks("arbitrum"),["arbitrum","eip155:42161"]);
+ assert.deepEqual(claimNetworks("eip155:42161"),["arbitrum","eip155:42161"]);
+ assert.deepEqual(claimNetworks("solana"),["solana"]);
+ const store=new MemoryClaimStore(),f=stub(),cfg={...cfgV2,claimStore:store,facilitator:f};
+ const offer=await offerFor(cfg);
+ assert.equal((await gate(URL,hdr(v2Payment(offer)),cfg)).paid,true);
+ assert.equal(store.size,2);
+ for(const alias of claimNetworks("arbitrum")){
+  assert.equal(store.claim(claimKey(alias,NONCE)),false,alias);
+ }
+});
+
+test("definite facilitator refusal releases both legacy claim aliases",async()=>{
+ const store=new MemoryClaimStore(),f=stub(),cfg={...cfgV2,claimStore:store,facilitator:f};
+ f.settle=async()=>({success:false,errorReason:"insufficient_funds",network:"eip155:42161"});
+ const offer=await offerFor(cfg);
+ const out=await gate(URL,hdr(v2Payment(offer)),cfg);
+ assert.equal(out.paid,false);
+ assert.match(out.body.error,/insufficient_funds/);
+ assert.equal(store.size,0);
+});
+
+test("indeterminate facilitator timeout keeps BOTH legacy claim aliases",async()=>{
+ const store=new MemoryClaimStore(),f=stub(),cfg={...cfgV2,claimStore:store,facilitator:f};
+ f.settle=async()=>{throw new Error("network timeout")};
+ const offer=await offerFor(cfg);
+ const first=await gate(URL,hdr(v2Payment(offer)),cfg);
+ assert.equal(first.paid,false);
+ assert.match(first.body.error,/settlement_unknown/);
+ assert.equal(store.size,2);
+ for(const alias of claimNetworks("arbitrum")){
+  assert.equal(store.claim(claimKey(alias,NONCE)),false);
+ }
 });

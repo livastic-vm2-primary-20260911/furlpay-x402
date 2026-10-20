@@ -274,7 +274,10 @@ test("an injected claim store is used instead of the default", async () => {
   const cfg = { ...CFG, facilitator: f, claimStore: store };
   const q = await quoteFor("https://x/a", cfg);
   await gate("https://x/a", header(payment(q)), cfg);
-  assert.strictEqual(store.size, 1);
+  // A single EIP-3009 authorization reserves BOTH historically deployed
+  // V1 network aliases (plain "base" and CAIP-2), so a rolling deployment
+  // cannot reuse the same spent authorization under a different spelling.
+  assert.strictEqual(store.size, 2);
 });
 
 // ── the store itself ───────────────────────────────────────────────────────

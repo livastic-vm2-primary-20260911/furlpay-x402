@@ -2,7 +2,7 @@ import { DEFAULT_FACILITATOR, useFacilitator, type Facilitator } from "./facilit
 import { verifyLocally } from "./verify";
 import { issueQuote, verifyQuote } from "./binding";
 import { MemoryClaimStore, canonicalNonce, claimKey, type PaymentClaimStore } from "./claims";
-import { caip2Network, claimNetwork, v2Requirements, v2Resource, validateV2 } from "./v2";
+import { caip2Network, claimNetworks, v2Requirements, v2Resource, validateV2 } from "./v2";
 import type {
   Network,
   AnyPaymentPayload,
@@ -338,19 +338,24 @@ export async function gate(
     }
   }
 
-  // IMPORTANT: V2 CAIP-2 network ids map to the existing deployed V1
-  // claim-store namespace, so a rolling upgrade cannot reclaim an earlier
-  // on-chain EIP-3009 authorization under a different key.
+  // Reserve both historical V1 network spellings in a deterministic order.
+  // An older V1 worker may have recorded a CAIP-2 claim, or a plain Base
+  // claim. A single canonical name would forget some already-spent payments.
   const singleUse = cfg.singleUse !== false;
   const store = singleUse ? resolveClaimStore(cfg) : null;
-  let key = "";
+  const claimKeys: string[] = [];
   if (store) {
     const identity = paymentIdentity(String(requirements.network), checkedPayload);
     if (!identity.ok) return challenge("malformed_payload: " + identity.detail);
-    key = claimKey(claimNetwork(String(requirements.network)), identity.nonce);
-    const won = await store.claim(key, identity.holdUntilMs);
-    if (!won) {
-      return challenge("payment_already_used: this authorization has already released the resource");
+    for (const networkAlias of claimNetworks(String(requirements.network))) {
+      const key = claimKey(networkAlias, identity.nonce);
+      const won = await store.claim(key, identity.holdUntilMs);
+      if (!won) {
+        // Release only keys this attempt acquired, NEVER the old payer's key.
+        for (const acquired of claimKeys) await store.release(acquired);
+        return challenge("payment_already_used: this authorization has already released the resource");
+      }
+      claimKeys.push(key);
     }
   }
 
@@ -368,13 +373,13 @@ export async function gate(
   }
 
   if (!settlement.success) {
-    if (store) await store.release(key);
+    if (store) for (const key of claimKeys) await store.release(key);
     return challenge(settlement.errorReason ?? "payment_failed");
   }
   if (cfg.requireSettlement && !meetsStrength(settlement.settlement, cfg.requireSettlement)) {
     // Only a paid response that passed the configured finality gate grants
     // the resource; this 402 refuses access without pretending it's settled.
-    if (store) await store.release(key);
+    if (store) for (const key of claimKeys) await store.release(key);
     return challenge("settlement_strength_insufficient: required " +
       cfg.requireSettlement + ", observed " + (settlement.settlement?.strength ?? "unknown"));
   }
